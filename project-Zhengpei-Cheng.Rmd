@@ -1,0 +1,261 @@
+---
+title: "Bladder Cancer RNA-Seq Analysis"
+documentclass: ctexart
+geometry: "left=2cm,right=2cm,top=2cm,bottom=2cm"
+author: "Zhengpei Cheng"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(width=80)
+```
+
+# Introduction
+
+## Introduction to biological question
+Bladder cancer is a malignant tumor derived from transitional epithelium, and its incidence rate ranks ninth among all cancers. With the development of sequencing technology, people can study the expression of genes in tumor tissues more comprehensively, which provides new ideas for the diagnosis and treatment of bladder cancer. In this project, we downloaded RNA-Seq gene expression data from the TCGA-BLCA dataset to analyze the differentially expressed genes between normal and tumor samples of bladder cancer
+
+## Description of the experimental design
+The experimental design includes downloading RNA-Seq gene expression data from the TCGA-BLCA dataset, preprocessing the data to filter out low-expressed genes and remove duplicates. Then, we divided the samples into two groups, normal and tumor samples, and conducted differential gene expression analysis on the two groups.
+
+## Description of the data preprocessing steps.
+We downloaded the RNA-Seq gene expression data of the TCGA-BLCA dataset using the TCGAbiolinks package. After downloading, we obtained a SummarizedExperiment object. We extracted mRNA data from the object by filtering the gene type. For mRNA data, we extracted the gene expression counts matrix. We added the gene symbol to the counts matrix to obtain the mRNA data frame. Next, we removed duplicates and filtered out low-expressed genes. Finally, we read in the mRNA data frame for subsequent analysis.
+```{r message=FALSE , warning=FALSE,include=FALSE}
+rm(list = ls())
+library(remotes)
+library(scater)
+library(edgeR)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(ggplot2)
+```
+```{r message=FALSE , warning=FALSE}
+query <- GDCquery(project = "TCGA-BLCA", 
+                  data.category = "Transcriptome Profiling",
+                  data.type = 'Gene Expression Quantification',
+                  experimental.strategy = "RNA-Seq",
+                  workflow.type = "STAR - Counts")
+GDCdownload(query)
+testdata <- GDCprepare(query = query)  # SummarizedExperiment object
+test_mRNA <- testdata[rowData(testdata)$gene_type == "protein_coding",] # extract mRNA
+```
+
+# Exploratory data analysis.
+
+## Quality control
+First, used addPerCellQC() to filter low quality cells and filter low quality genes that mean of reads < 10
+```{r,include=FALSE}
+colData(test_mRNA)$tumor_normal <- as.factor(ifelse(as.numeric(substr(colnames(test_mRNA), 14, 15)) < 10, "tumor", "normal"))
+assayNames(test_mRNA)[1] <- "counts"
+test_mRNA <- addPerCellQC(test_mRNA)
+#Average of duplicate genes
+#assay(test_mRMA,"counts")<-limma::avereps(assay(test_mRNA,"counts"))
+qcfilt <- perCellQCFilters(test_mRNA,nmad=3)
+table(qcfilt$discard)
+test_mRNA <- test_mRNA[, !qcfilt$discard]
+#Filtering for low expression genes, which can be adjusted for gene number 
+filter <- rowMeans(assay(test_mRNA))>=10
+table(filter)
+test_mRNA <- test_mRNA[filter,]
+```
+```{r}
+test_mRNA
+table(qcfilt$discard)
+table(filter)
+```
+
+## Normalization
+Normalization by TMM and draw RLE plot to measure the quality of normalization. It shows that TMM normalization has a good performance.
+```{r}
+dge<-test_mRNA
+tmm_factors <- calcNormFactors(assay(dge,"counts"), method = "TMM")
+scales <- colSums(assay(dge,"counts")) * tmm_factors
+tmm <- t(t(assay(dge,"counts"))/scales * mean(scales))
+assay(dge, "logcounts") <- log1p(tmm)
+scater::plotRLE(as(dge,"SingleCellExperiment"),colour_by = "sample_type",exprs_values = "logcounts")
+```
+
+## Principal component analysis (PCA)
+Do some exploratory data analysis by principle component analysis and also draw some pictures of PCA, and UMAP. It seems that those samples are divided into 2 clusters. However, there are more than 200 dimensions in this data set, I just chose if "sample_type" and "paper_AJCC pathologic tumor stage" are associated with this result. It seems that those 2 dimensions are not related with 2 clusters.
+```{r,echo=FALSE}
+PCA<-scater::runPCA(as(dge,"SingleCellExperiment"))
+plotPCA(PCA,colour_by="sample_type")
+PCA<-scater::runUMAP(PCA,dimred="PCA")
+scater::plotUMAP(PCA,colour_by="paper_AJCC pathologic tumor stage",shape_by="tumor_normal")
+```
+
+## Correlation of principal components with quality control indicators
+Besides, to find the correlation between principle components 1-5(PC1-5) and interested quality control metrics, I chose "sample_type", "detected", "sum", "race", "gender", "pack_years_smoked". Finally, it seems that they do not have high correlation with PC1-5.
+
+```{r,echo=FALSE,,out.height='35%'}
+pc_5<-reducedDims(PCA)$PCA[,1:5]
+colData(PCA)[,c("sample_type","race","gender")] <- lapply(colData(PCA)[,c("sample_type","race","gender")], as.factor)
+interest_cols<-c("sample_type","detected","sum","race","gender","pack_years_smoked","tumor_normal")
+qc_metrics<-as.matrix(colData(PCA)[,interest_cols])
+cor_metrics<-abs(cor(qc_metrics,pc_5))
+barplot(cor_metrics,beside=TRUE,main="Correlation between PC1-5 and QC Metrics",xlab="QC Metrics",ylab="Correlation")
+```
+
+Because I want to extract data from summarizedexperiment object, I extract expression matrix, removed duplicates and filtered out low-expressed genes again.
+```{r,include=FALSE}
+# counts matrix of mRNA
+test.mRNA.counts <- assay(test_mRNA,"counts") # counts matrix
+# add gene_symbol,gene_name
+mRNA.symbol <- rowData(test_mRNA)$gene_name
+# combine
+test.mrna.frame <- cbind(as.data.frame(mRNA.symbol),
+                         as.data.frame(test.mRNA.counts))
+```
+
+```{r,include=FALSE}
+# Remove duplicated
+qc = as.matrix(test.mrna.frame)
+rownames(qc)=qc[,1] # gene_symbol
+exp=qc[,2:ncol(qc)] # matrix
+dimnames=list(rownames(exp),colnames(exp))
+data=matrix(as.numeric(as.matrix(exp)),nrow=nrow(exp),dimnames=dimnames)
+
+#Average of duplicate genes
+data = limma::avereps(data) 
+
+#Filtering for low expression genes, which can be adjusted for gene number 
+BLCA.test=data[rowMeans(data)>10,]
+
+dim(BLCA.test) 
+rt <- rbind(colnames(BLCA.test),BLCA.test)
+rt<-rt[-1,]
+rt<-apply(rt,c(1,2), as.numeric)
+dim(rt)
+rt <- round(rt,0)
+```
+Devided samples into 'tumor' group and 'normal' group. If the 14th and 15th string of rt's colnames is "01", that means tumor sample. If it is "11", that means normal sample
+```{r}
+dim(rt)
+head(rt[,1:2])
+group <- factor(ifelse(as.integer(substr(colnames(rt),14,15))<10,'tumor','normal'),
+                levels = c('normal','tumor'))
+table(group)
+```
+
+
+# Application of statistical models to answer the biologicalquestion.
+
+## Differential gene expression analysis
+I set cutoff of logFC equal to 1 and threshold of False Discovery Rate (FDR) equal to 0.05.Then calculate the normalization factors (by TMM), the dispersion estimates, and the design matrix for "tumor" and "normal" group, we can fit our log-linear model. After that, I built a contrast matrix for them to find the differential expression genes between them. Used the likelihood ratio test to identify differentially expressed genes, via the glmLRT function. To identify which genes are differentially expressed, I used the topTags function, specifying a p-value cutoff.
+```{r}
+# Differential gene expression analysis
+logFC_cutoff=1
+padj=0.05
+dge <- DGEList(counts=rt,group=group)  
+dge$samples$lib.size <- colSums(dge$counts)
+# Normalization
+dge <- calcNormFactors(dge,method = "TMM") 
+# Design matrix
+design <- model.matrix(~0+factor(group))
+colnames(design) <- c('normal','tumor')
+rownames(design)<-colnames(dge)
+colnames(design)<-levels(group)
+# estimate Divergence
+dge <- estimateGLMCommonDisp(dge,design)
+dge <- estimateGLMTrendedDisp(dge, design)
+dge <- estimateGLMTagwiseDisp(dge, design)
+fit <- glmFit(dge, design)
+fit1 <- glmLRT(fit, contrast=c(-1,1))
+# correct P value and extract gene
+DEG1=topTags(fit1, n=nrow(rt))#n=nrow(rt)
+DEG=as.data.frame(topTags(fit1,n=100))
+DEG=as.data.frame(DEG)
+DEG1=as.data.frame(DEG1)
+```
+Then I filtered genes which FDR<0.05 and  absolute values of  logFC>1
+```{r,include=FALSE}
+# significant differential gene expression
+significant = DEG1[(
+  (DEG1$FDR < padj) & (abs(DEG1$logFC) > logFC_cutoff)
+),] 
+write.table(significant, file="significant.xls",sep="\t",quote=F)
+
+# up-expression gene
+upregulation = DEG1[(DEG1$FDR < padj & (DEG1$logFC>logFC_cutoff)),]
+write.table(upregulation, file="upregulation.xls",sep="\t",quote=F)
+
+# down-expression gene
+downregulation = DEG1[(DEG1$FDR < padj & (DEG1$logFC<(-logFC_cutoff))),]
+write.table(downregulation, file="downregulation.xls",sep="\t",quote=F)
+
+DEG$change <- factor(ifelse(DEG$FDR < padj & abs(DEG$logFC) > logFC_cutoff,
+                            ifelse(DEG$logFC > logFC_cutoff ,'UP','DOWN'),
+                            'NOT'))
+DEG1$change<- factor(ifelse(DEG1$FDR < padj & abs(DEG1$logFC) > logFC_cutoff,
+                            ifelse(DEG1$logFC > logFC_cutoff ,'UP','DOWN'),
+                            'NOT'))
+```
+
+# Biological interpretation of the results
+From the differentially expressed genes, we can see that many of them have been previously reported in bladder cancer studies. For example, KIF18B and MEN1 are known to be over-expressed in bladder cancer, while MYOM1 is known to be under-expressed. Other genes, such as PLOD1, have also been associated with bladder cancer progression;KLHL41 stabilizes skeletal muscle sarcomeres by nonproteolytic ubiquitination
+```{r}
+head(significant)
+head(upregulation)
+head(downregulation)
+```
+Finally, used volcano plot to visualize differential expression gene and used heatmap to visualize different gene expression between tumor and normal samples. Since there are too many differential expression genes, I random select 100 genes from them to draw heatmap.
+
+```{r,echo=FALSE ,out.height='40%', fig.align='center'}
+# ggplot2 volcano
+
+g <- ggplot(DEG1,aes(logFC,-log10(as.numeric(FDR)),color=change))
+
+g + geom_point()
+  labs(x = 'log2 Fold Change', y = '-log10 adjust p-value', title = 'volcano_plot') + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20,color = 'firebrick'), 
+        panel.grid = element_blank(), 
+        panel.background = element_rect(color = 'black', fill = 'transparent'), 
+        legend.key = element_rect(fill = 'transparent')) + 
+  geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff), lty = 2, color = 'black') +  #添加阈值线
+  geom_hline(yintercept = -log10(padj), lty = 2, color = 'black') +
+  xlim(-10, 10) + ylim(0, 40)
+
+
+# df <- tibble::column_to_rownames(df,var = 'id')
+sig_g<-rt[rownames(significant),]
+set.seed(1200)
+#df<-sig_g 
+df <- sig_g[sample(1:nrow(sig_g),100),]
+
+sample_types <- ifelse(as.numeric(substr(colnames(df), 14, 15)) < 10, "tumor", "normal")
+# devide sample name by tumor and normal
+normal_samples <- colnames(df)[sample_types == "normal"]
+tumor_samples <- colnames(df)[sample_types == "tumor"]
+
+#reorder
+sorted_samples <- c(normal_samples, tumor_samples)
+df<-df[,sorted_samples]
+sorted_sample_types <- ifelse(as.numeric(substr(colnames(df), 14, 15)) < 10, "tumor", "normal")
+
+annotation_col <- structure(list(sample_type = sorted_sample_types), .Names = "sample_type", row.names = colnames(df), class = "data.frame")
+
+
+#png("my_pheatmap.png", width = 9600, height = 3600,res=1200)
+pheatmap::pheatmap(df, 
+         #annotation_row=dfGene, 
+         annotation_col=annotation_col, 
+         show_colnames = FALSE, 
+         show_rownames=TRUE,  
+         fontsize=1, 
+         color = colorRampPalette(c('#0000ff','#ffffff','#ff0000'))(50), 
+         #annotation_legend=TRUE, 
+         border_color=NA ,  
+         scale="row",  
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE, 
+          #fontsize_row = 8,
+         #cellheight = 10,
+         #cellwidth = 2 
+         )
+
+#dev.off()
+```
